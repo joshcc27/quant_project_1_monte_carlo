@@ -1,54 +1,123 @@
-"""Basic Monte Carlo pricing helpers."""
-import time
+"""Basic Monte Carlo pricing helpers.
+
+This module owns baseline Monte Carlo pricing flow:
+- transform simulated market outputs to pathwise payoffs,
+- discount payoffs to valuation time,
+- build standard result summaries with uncertainty diagnostics.
+
+Result-schema construction is delegated to ``src.mc_results``.
+"""
 import numpy as np
-from scipy.stats import norm
-from payoffs import asian_arithmetic_payoff, european_payoff
-
-Z_95 = norm.ppf(0.975)  # 95% normal quantile
-
-
-def _build_result(discounted_payoffs, start_time, extra=None):
-    # ensure numpy array for vectorised stats
-    discounted_payoffs = np.asarray(discounted_payoffs, dtype=float)
-    n_paths = discounted_payoffs.shape[0]
-    if n_paths == 0:
-        raise ValueError("No payoffs provided")
-
-    price = discounted_payoffs.mean()  # Monte Carlo estimator
-
-    if n_paths > 1:
-        stderr = discounted_payoffs.std(ddof=1) / np.sqrt(n_paths)  # standard error 
-    else:
-        stderr = 0.0
-
-    half_ci = Z_95 * stderr
-
-    return {
-        "price": price,
-        "stderr": stderr,
-        "ci_low": price - half_ci,
-        "ci_high": price + half_ci,
-        "n_paths": n_paths,
-        "runtime_seconds": time.perf_counter() - start_time,
-        "extra": extra or {},
-    }
+from .mc_results import build_result_iid, discount_payoffs
+from .payoffs import asian_arithmetic_payoff, european_payoff
 
 
 def _mc_price(data, payoff_fn, K, r, T, option_type):
-    start = time.perf_counter()  # timing for diagnostics
+    """Generic Monte Carlo pricing routine parameterised by payoff function.
+
+    Parameters
+    ----------
+    data : array-like
+        Simulation output consumed by ``payoff_fn``.
+        For European options this is terminal prices ``ST``; for arithmetic
+        Asian options this is the full path matrix.
+    payoff_fn : callable
+        Function with signature ``payoff_fn(data, K, option_type)`` that
+        returns pathwise intrinsic payoffs.
+    K : float
+        Strike price.
+    r : float
+        Continuously compounded risk-free rate.
+    T : float
+        Time to maturity in years.
+    option_type : str
+        Option side, case-insensitive: ``"call"`` or ``"put"``.
+
+    Returns
+    -------
+    dict
+        Standard Monte Carlo result dictionary from
+        ``src.mc_results.build_result_iid``.
+    """
+    # Ensure numeric array input before passing to payoff routines.
     arr = np.asarray(data, dtype=float)
+    # Compute intrinsic payoff path by path using selected payoff function.
     payoffs = payoff_fn(arr, K, option_type)
-    discounted = np.exp(-r * T) * payoffs  # discount payoffs to t=0
-    return _build_result(discounted, start)
+    # Convert maturity payoffs to present values.
+    discounted = discount_payoffs(payoffs, r, T)
+    # Build unified pricing and uncertainty summary.
+    return build_result_iid(discounted)
 
 
 def mc_price_european(ST, K, r, T, option_type):
-    """Price European option from terminal prices ST."""
+    """Price a European option from simulated terminal prices.
 
-    return _mc_price(ST, european_payoff, K, r, T, option_type)
+    Parameters
+    ----------
+    ST : array-like
+        Terminal prices at maturity for all simulated paths.
+    K : float
+        Strike price.
+    r : float
+        Continuously compounded risk-free rate.
+    T : float
+        Time to maturity in years.
+    option_type : str
+        Option side, case-insensitive: ``"call"`` or ``"put"``.
+
+    Returns
+    -------
+    dict
+        Standard Monte Carlo result dictionary containing ``price``,
+        ``stderr``, confidence interval bounds, sample count, and ``extra``.
+
+    Raises
+    ------
+    ValueError
+        If ``ST`` is not a one-dimensional array-like.
+    """
+    # Enforce 1D terminal-price convention for European payoffs.
+    st_arr = np.asarray(ST, dtype=float)
+    if st_arr.ndim != 1:
+        raise ValueError("ST must be a 1D array-like of terminal prices")
+
+    return _mc_price(st_arr, european_payoff, K, r, T, option_type)
 
 
 def mc_price_asian_arithmetic(paths, K, r, T, option_type):
-    """Price arithmetic Asian option from full simulated paths."""
+    """Price an arithmetic-average Asian option from full simulated paths.
 
-    return _mc_price(paths, asian_arithmetic_payoff, K, r, T, option_type)
+    Parameters
+    ----------
+    paths : array-like
+        Simulated path matrix where rows are paths and columns are times.
+    K : float
+        Strike price.
+    r : float
+        Continuously compounded risk-free rate.
+    T : float
+        Time to maturity in years.
+    option_type : str
+        Option side, case-insensitive: ``"call"`` or ``"put"``.
+
+    Returns
+    -------
+    dict
+        Standard Monte Carlo result dictionary containing ``price``,
+        ``stderr``, confidence interval bounds, sample count, and ``extra``.
+
+    Raises
+    ------
+    ValueError
+        If ``paths`` is not a two-dimensional array-like with at least two
+        time columns (initial value + at least one monitoring point).
+    """
+    # Enforce matrix input: rows are paths, columns are observation times.
+    path_arr = np.asarray(paths, dtype=float)
+    if path_arr.ndim != 2:
+        raise ValueError("paths must be a 2D array-like with shape (n_paths, n_times)")
+    # Require at least initial value and one monitored value.
+    if path_arr.shape[1] < 2:
+        raise ValueError("paths must include at least one monitoring date beyond S0")
+
+    return _mc_price(path_arr, asian_arithmetic_payoff, K, r, T, option_type)
